@@ -19,7 +19,6 @@ module memory_management_unit #(
     parameter NUM_ST_PORTS      = 1,
     parameter ENABLE_FORWARDING = 1,
     parameter ENABLE_COALESCING = 1,
-    parameter ENABLE_SPECULATION= 1,
     parameter LQ_DEPTH = 8,
     parameter SQ_DEPTH = 8
 ) (
@@ -62,9 +61,6 @@ module memory_management_unit #(
     // Control and status
     // ------------------------------------------------------------------------
     input  logic flush,
-    output logic violation_detected,
-    output logic [$clog2(ROB_SIZE)-1:0] violation_rob_index,
-    output logic [31:0] violation_pc,
     output logic lq_full,
     output logic sq_full,
     output lq_entry_t lq_debug [LQ_DEPTH],
@@ -119,11 +115,14 @@ module memory_management_unit #(
     integer ld_comb_i, st_comb_i, sq_comb_i, sq_comb_j, lq_comb_i, lq_comb_j, lq_deq_comb_i, sq_deq_comb_i, lq_dispatch_comb_i;
     integer l_comb, s_comb, port_comb;
     integer ld_issued, st_issued, issued_idx, issued_count;
-    integer store_start, store_end, load_start, load_end;
+    // Variables for always_ff block
+    integer store_start_ff, store_end_ff, load_start_ff, load_end_ff;
+    // Variables for always_comb block  
+    integer store_start_comb, store_end_comb, load_start_comb, load_end_comb;
     integer youngest_store_idx, youngest_store_tag, commit_slot, issue_sq;
-    logic overlap;
-    bit was_forwarded;
     logic mmu_debug;
+    logic safe_to_issue_store;
+    integer check_lq;
     // ------------------------------------------------------------------------
     // Reset and Dispatch Logic
     // ------------------------------------------------------------------------
@@ -291,12 +290,14 @@ module memory_management_unit #(
                 end
             end
         end
-        // Colaescing squashes older stores to the same address
+        // Coalescing squashes older stores to the same address with same data
         if (ENABLE_COALESCING) begin
             for (sq_ff_i = 0; sq_ff_i < SQ_DEPTH; sq_ff_i++) begin
                 if (sq_next[sq_ff_i].valid && !sq_next[sq_ff_i].issued && !sq_next[sq_ff_i].completed) begin
                     for (sq_ff_j = 0; sq_ff_j < SQ_DEPTH; sq_ff_j++) begin
-                        if (sq_ff_i != sq_ff_j && sq_next[sq_ff_j].valid && !sq_next[sq_ff_j].issued && !sq_next[sq_ff_j].completed && sq_next[sq_ff_j].addr == sq_next[sq_ff_i].addr && sq_next[sq_ff_j].size == sq_next[sq_ff_i].size && sq_next[sq_ff_j].rob_tag > sq_next[sq_ff_i].rob_tag) begin
+                        if (sq_ff_i != sq_ff_j && sq_next[sq_ff_j].valid && !sq_next[sq_ff_j].issued && !sq_next[sq_ff_j].completed && 
+                            sq_next[sq_ff_j].addr == sq_next[sq_ff_i].addr && sq_next[sq_ff_j].size == sq_next[sq_ff_i].size && 
+                            sq_next[sq_ff_j].data == sq_next[sq_ff_i].data && sq_next[sq_ff_j].rob_tag > sq_next[sq_ff_i].rob_tag) begin
                             sq_next[sq_ff_i].completed = 1'b1;
                         end
                     end
@@ -307,8 +308,27 @@ module memory_management_unit #(
         for(issued_idx = 0; issued_idx < ISSUE_WIDTH; issued_idx++)begin
             for (issue_sq = 0; issue_sq < SQ_DEPTH; issue_sq++) begin
                 if (sq_next[issue_sq].valid && !sq_next[issue_sq].issued && !sq_next[issue_sq].completed && sq_next[issue_sq].rob_tag == rob_head[issued_idx] && issued_count <= ISSUE_WIDTH) begin
-                    sq_next[issue_sq].issued = 1'b1;
-                    issued_count++;
+                    // Check that all older loads with address overlap have been completed before issuing this store
+                    safe_to_issue_store = 1;
+                                         for (check_lq = 0; check_lq < LQ_DEPTH; check_lq++) begin
+                         if (lq[check_lq].valid && lq[check_lq].rob_tag < sq_next[issue_sq].rob_tag && !lq[check_lq].completed) begin
+                             // Check for address overlap (exact match or partial overlap)
+                             store_start_ff = sq_next[issue_sq].addr;
+                             store_end_ff   = sq_next[issue_sq].addr + (sq_next[issue_sq].size == 2'b00 ? 0 : (sq_next[issue_sq].size == 2'b01 ? 1 : 3));
+                             load_start_ff  = lq[check_lq].addr;
+                             load_end_ff    = lq[check_lq].addr + (lq[check_lq].size == 2'b00 ? 0 : (lq[check_lq].size == 2'b01 ? 1 : 3));
+                             
+                             // Check if addresses overlap
+                             if (!(store_end_ff < load_start_ff || load_end_ff < store_start_ff)) begin
+                                 safe_to_issue_store = 0;
+                             end
+                         end
+                    end
+                    
+                    if (safe_to_issue_store) begin
+                        sq_next[issue_sq].issued = 1'b1;
+                        issued_count++;
+                    end
                 end
             end
         end
@@ -343,9 +363,6 @@ module memory_management_unit #(
             mem_write_size[st_comb_i] = 0;
             issued_sq_idx[st_comb_i]  = -1;
         end
-        violation_detected = 0;
-        violation_rob_index = 0;
-        violation_pc = 0;
         // Base issue logic
         ld_issued = 0;
         st_issued = 0;
@@ -358,14 +375,26 @@ module memory_management_unit #(
                     // Find the most recent store that matches this load (lowest ROB_ID)
                     youngest_store_idx = -1;
                     youngest_store_tag = -1;
-                    for (sq_comb_j = 0; sq_comb_j < SQ_DEPTH; sq_comb_j++) begin
-                        if (sq[sq_comb_j].valid && sq[sq_comb_j].rob_tag < lq[lq_comb_i].rob_tag && lq[lq_comb_i].addr == sq[sq_comb_j].addr && lq[lq_comb_i].size == sq[sq_comb_j].size) begin
-                            if (youngest_store_idx == -1 || sq[sq_comb_j].rob_tag < youngest_store_tag) begin
-                                youngest_store_tag = sq[sq_comb_j].rob_tag;
-                                youngest_store_idx = sq_comb_j;
-                                forwarded = 1;
-                            end
-                        end
+                                         for (sq_comb_j = 0; sq_comb_j < SQ_DEPTH; sq_comb_j++) begin
+                         if (sq[sq_comb_j].valid && sq[sq_comb_j].rob_tag < lq[lq_comb_i].rob_tag) begin
+                             // Check for address overlap (exact match or partial overlap)
+                             store_start_comb = sq[sq_comb_j].addr;
+                             store_end_comb   = sq[sq_comb_j].addr + (sq[sq_comb_j].size == 2'b00 ? 0 : (sq[sq_comb_j].size == 2'b01 ? 1 : 3));
+                             load_start_comb  = lq[lq_comb_i].addr;
+                             load_end_comb    = lq[lq_comb_i].addr + (lq[lq_comb_i].size == 2'b00 ? 0 : (lq[lq_comb_i].size == 2'b01 ? 1 : 3));
+                             
+                             // Check if addresses overlap
+                             if (!(store_end_comb < load_start_comb || load_end_comb < store_start_comb)) begin
+                                 // Check if store is ready (has data)
+                                 if (sq[sq_comb_j].completed) begin
+                                     if (youngest_store_idx == -1 || sq[sq_comb_j].rob_tag < youngest_store_tag) begin
+                                         youngest_store_tag = sq[sq_comb_j].rob_tag;
+                                         youngest_store_idx = sq_comb_j;
+                                         forwarded = 1;
+                                     end
+                                 end
+                             end
+                         end
                     end
                 end
                 if (forwarded) begin
@@ -405,45 +434,6 @@ module memory_management_unit #(
                 end
             end
         end
-        end
-        // Improved speculation violation check: only consider the youngest overlapping completed store for each completed load
-        if (ENABLE_SPECULATION) begin
-            for (l_comb = 0; l_comb < LQ_DEPTH; l_comb++) begin
-                if (lq[l_comb].valid && lq[l_comb].completed) begin
-                    youngest_store_idx = -1;
-                    youngest_store_tag = -1;
-                    for (s_comb = 0; s_comb < SQ_DEPTH; s_comb++) begin
-                        if (sq[s_comb].valid && sq[s_comb].completed && sq[s_comb].rob_tag < lq[l_comb].rob_tag) begin
-                            overlap = 0;
-                            store_start = sq[s_comb].addr;
-                            store_end   = sq[s_comb].addr + (1 << sq[s_comb].size) - 1;
-                            load_start  = lq[l_comb].addr;
-                            load_end    = lq[l_comb].addr + (1 << lq[l_comb].size) - 1;
-                            if (!(store_end < load_start || load_end < store_start)) begin
-                                overlap = 1;
-                            end
-                            if (overlap && sq[s_comb].rob_tag > youngest_store_tag) begin
-                                youngest_store_tag = sq[s_comb].rob_tag;
-                                youngest_store_idx = s_comb;
-                            end
-                        end
-                    end
-                    if (youngest_store_idx != -1) begin
-                        was_forwarded = 0;
-                        for (port_comb = 0; port_comb < NUM_LD_PORTS; port_comb++) begin
-                            if (ENABLE_FORWARDING && load_cdb_result[port_comb].result_ready && lq[l_comb].rob_tag == load_cdb_result[port_comb].ROB_index && !mem_read_en[port_comb] && sq[youngest_store_idx].data == load_cdb_result[port_comb].result) begin
-                                was_forwarded = 1;
-                            end
-                        end
-                        if (!was_forwarded) begin
-                            violation_detected = 1;
-                            violation_rob_index = lq[l_comb].rob_tag;
-                            violation_pc = lq[l_comb].pc;
-                            $fatal(1, "[%0t] [MMU][SPECULATION VIOLATION] Load ROB_ID=%0d PC=0x%08x Addr=0x%08x after Store ROB_ID=%0d (youngest overlap)", $time, lq[l_comb].rob_tag, lq[l_comb].pc, lq[l_comb].addr, sq[youngest_store_idx].rob_tag);
-                        end
-                    end
-                end
-            end
         end
         for (ld_comb_i = 0; ld_comb_i < NUM_LD_PORTS; ld_comb_i++) begin
             if (mem_read_en[ld_comb_i] && load_cdb_result[ld_comb_i].result_ready == 0) begin
